@@ -6,8 +6,10 @@
 #include <conio.h>
 #include <windows.h>
 #include <algorithm>
-#include <map>
 #include <memory>
+#include <stdexcept>
+#include <cassert>
+#include <ctime>
 
 using namespace std;
 
@@ -19,26 +21,25 @@ class ToolState;
 class EditorContext;
 class CanvasObserver;
 
-// Предварительные объявления классов команд
-class DrawLineCommand;
-class DrawRectCommand;
-class FloodFillCommand;
-class ClearCommand;
-
 // ==================== КЛАСС MEMENTO ====================
 class Memento {
 private:
-    vector<vector<char>> snapshot;
-    int cursorX;
-    int cursorY;
-    char currentChar;
+    const vector<vector<char>> snapshot;
+    const int cursorX;
+    const int cursorY;
+    const char currentChar;
 
 public:
-    Memento(const vector<vector<char>>& grid, int x, int y, char ch)
-        : snapshot(grid), cursorX(x), cursorY(y), currentChar(ch) {
+    Memento(vector<vector<char>>&& grid, int x, int y, char ch) noexcept
+        : snapshot(std::move(grid)), cursorX(x), cursorY(y), currentChar(ch) {
     }
 
-    vector<vector<char>> getGrid() const { return snapshot; }
+    Memento(const Memento&) = delete;
+    Memento& operator=(const Memento&) = delete;
+    Memento(Memento&&) = default;
+    Memento& operator=(Memento&&) = default;
+
+    const vector<vector<char>>& getGrid() const { return snapshot; }
     int getCursorX() const { return cursorX; }
     int getCursorY() const { return cursorY; }
     char getCurrentChar() const { return currentChar; }
@@ -53,21 +54,107 @@ public:
     virtual void onToolChanged(const string& toolName, const string& statusMsg) = 0;
 };
 
+// ==================== SINGLETON - ЛОГГЕР ПРИЛОЖЕНИЯ ====================
+class AppLogger {
+private:
+    static unique_ptr<AppLogger> instance;
+    ofstream logFile;
+    bool consoleOutput;
+
+    // Приватный конструктор
+    AppLogger() : consoleOutput(true) {
+        logFile.open("ascii_draw.log", ios::out | ios::app);
+        if (logFile.is_open()) {
+            logFile << "=== ASCII Draw Studio Session Started ===" << endl;
+        }
+    }
+
+    // Запрет копирования и присваивания
+    AppLogger(const AppLogger&) = delete;
+    AppLogger& operator=(const AppLogger&) = delete;
+
+    // Вспомогательный метод для безопасного получения времени
+    string getCurrentTime() {
+        time_t now = time(0);
+        char buffer[26];
+        ctime_s(buffer, sizeof(buffer), &now);
+        // Убираем перевод строки в конце
+        string timeStr(buffer);
+        if (!timeStr.empty() && timeStr.back() == '\n') {
+            timeStr.pop_back();
+        }
+        return timeStr;
+    }
+
+public:
+    ~AppLogger() {
+        if (logFile.is_open()) {
+            logFile << "=== Session Ended ===" << endl;
+            logFile.close();
+        }
+    }
+
+    // Получение единственного экземпляра
+    static AppLogger* getInstance() {
+        if (!instance) {
+            // Используем new вместо make_unique для обхода приватного конструктора
+            instance.reset(new AppLogger());
+        }
+        return instance.get();
+    }
+
+    void log(const string& message) {
+        string timestamp = getCurrentTime();
+        if (logFile.is_open()) {
+            logFile << "[" << timestamp << "] " << message << endl;
+        }
+        if (consoleOutput) {
+            cout << "[LOG] " << message << endl;
+        }
+    }
+
+    void setConsoleOutput(bool enabled) {
+        consoleOutput = enabled;
+    }
+
+    void warning(const string& message) {
+        log("WARNING: " + message);
+    }
+
+    void error(const string& message) {
+        log("ERROR: " + message);
+    }
+};
+
+// Инициализация статического члена
+unique_ptr<AppLogger> AppLogger::instance = nullptr;
+
 // ==================== БАЗОВЫЙ КЛАСС COMMAND ====================
 class Command {
 protected:
     Canvas* canvas;
-    Memento* backup;
+    unique_ptr<Memento> backup;
 
 public:
-    Command(Canvas* c) : canvas(c), backup(nullptr) {}
-    virtual ~Command() { delete backup; }
+    explicit Command(Canvas* c) : canvas(c), backup(nullptr) {
+        if (!canvas) {
+            AppLogger::getInstance()->error("Command created with null Canvas pointer");
+            throw invalid_argument("Canvas cannot be null");
+        }
+    }
+
+    virtual ~Command() = default;
 
     void saveBackup();
     void undo();
 
     virtual void execute() = 0;
     virtual string getDescription() const = 0;
+
+    Command(const Command&) = delete;
+    Command& operator=(const Command&) = delete;
+    Command(Command&&) = default;
+    Command& operator=(Command&&) = default;
 };
 
 // ==================== КЛАСС CANVAS ====================
@@ -88,16 +175,22 @@ public:
         if (height < 20) height = 20;
         if (height > 100) height = 100;
         grid = vector<vector<char>>(height, vector<char>(width, '.'));
+
+        AppLogger::getInstance()->log("Canvas created: " + to_string(width) + "x" + to_string(height));
     }
 
     void attachObserver(CanvasObserver* observer) {
-        observers.push_back(observer);
+        if (observer) {
+            observers.push_back(observer);
+            AppLogger::getInstance()->log("Observer attached");
+        }
     }
 
     void detachObserver(CanvasObserver* observer) {
         auto it = find(observers.begin(), observers.end(), observer);
         if (it != observers.end()) {
             observers.erase(it);
+            AppLogger::getInstance()->log("Observer detached");
         }
     }
 
@@ -108,12 +201,14 @@ public:
     }
 
     void notifyStateChanged(const string& message) {
+        AppLogger::getInstance()->log("State: " + message);
         for (auto observer : observers) {
             observer->onStateChanged(message);
         }
     }
 
     void notifyToolChanged(const string& toolName, const string& statusMsg) {
+        AppLogger::getInstance()->log("Tool changed: " + toolName);
         for (auto observer : observers) {
             observer->onToolChanged(toolName, statusMsg);
         }
@@ -124,7 +219,13 @@ public:
     int getCursorX() const { return cursorX; }
     int getCursorY() const { return cursorY; }
     char getCurrentChar() const { return currentChar; }
-    char getPixel(int x, int y) const { return grid[y][x]; }
+    char getPixel(int x, int y) const {
+        if (x >= 0 && x < width && y >= 0 && y < height) {
+            return grid[y][x];
+        }
+        return '.';
+    }
+
     vector<vector<char>> getGridSnapshot() const { return grid; }
 
     void restoreFromMemento(const Memento& memento) {
@@ -243,7 +344,10 @@ public:
 
     bool saveToFile(const string& filename) {
         ofstream file(filename);
-        if (!file.is_open()) return false;
+        if (!file.is_open()) {
+            AppLogger::getInstance()->error("Cannot open file for saving: " + filename);
+            return false;
+        }
 
         for (int y = 0; y < height; y++) {
             for (int x = 0; x < width; x++) {
@@ -251,13 +355,17 @@ public:
             }
             file << endl;
         }
+        AppLogger::getInstance()->log("Canvas saved to file: " + filename);
         notifyStateChanged("Сохранено в файл: " + filename);
         return true;
     }
 
     bool loadFromFile(const string& filename) {
         ifstream file(filename);
-        if (!file.is_open()) return false;
+        if (!file.is_open()) {
+            AppLogger::getInstance()->error("Cannot open file for loading: " + filename);
+            return false;
+        }
 
         vector<vector<char>> newGrid(height, vector<char>(width, '.'));
         string line;
@@ -271,6 +379,7 @@ public:
         }
 
         grid = newGrid;
+        AppLogger::getInstance()->log("Canvas loaded from file: " + filename);
         notifyCanvasChanged();
         notifyStateChanged("Загружено из файла: " + filename);
         return true;
@@ -280,55 +389,90 @@ public:
 // ==================== КЛАСС HISTORY ====================
 class CommandHistory {
 private:
-    stack<Command*> undoStack;
-    stack<Command*> redoStack;
+    stack<unique_ptr<Command>> undoStack;
+    stack<unique_ptr<Command>> redoStack;
 
 public:
-    CommandHistory() {}
-    ~CommandHistory();
+    CommandHistory() = default;
+    ~CommandHistory() = default;
 
-    void executeCommand(Command* cmd);
-    void undo();
-    void redo();
-};
+    void executeCommand(unique_ptr<Command> cmd) {
+        if (!cmd) {
+            AppLogger::getInstance()->warning("Attempt to execute null command");
+            return;
+        }
 
-// ==================== КЛАСС EDITOR CONTEXT ====================
-class EditorContext {
-private:
-    ToolState* currentState;
-    Canvas* canvas;
-    CommandHistory* history;
+        try {
+            cmd->execute();
+            undoStack.push(std::move(cmd));
 
-public:
-    EditorContext(Canvas* c, CommandHistory* h);
-    ~EditorContext();
+            while (!redoStack.empty()) {
+                redoStack.pop();
+            }
+            AppLogger::getInstance()->log("Command executed successfully");
+        }
+        catch (const exception& e) {
+            string errorMsg = "Command execution failed: " + string(e.what());
+            cerr << errorMsg << endl;
+            AppLogger::getInstance()->error(errorMsg);
+        }
+    }
 
-    void setState(ToolState* newState);
-    ToolState* getState() const { return currentState; }
+    void undo() {
+        if (undoStack.empty()) {
+            AppLogger::getInstance()->log("Nothing to undo");
+            return;
+        }
 
-    Canvas* getCanvas() const { return canvas; }
-    CommandHistory* getHistory() const { return history; }
+        unique_ptr<Command> cmd = std::move(undoStack.top());
+        undoStack.pop();
 
-    void executeCommand(Command* cmd);
-    void undo();
-    void redo();
+        try {
+            cmd->undo();
+            redoStack.push(std::move(cmd));
+            AppLogger::getInstance()->log("Undo performed");
+        }
+        catch (const exception& e) {
+            string errorMsg = "Undo failed: " + string(e.what());
+            cerr << errorMsg << endl;
+            AppLogger::getInstance()->error(errorMsg);
+            undoStack.push(std::move(cmd));
+        }
+    }
 
-    void moveCursor(int dx, int dy);
-    void handleKeyPress(char key);
-    void handleCursorMove(int dx, int dy);
+    void redo() {
+        if (redoStack.empty()) {
+            AppLogger::getInstance()->log("Nothing to redo");
+            return;
+        }
 
-    string getCurrentToolName() const;
-    string getStatusMessage() const;
-    bool isDrawingMode() const;
+        unique_ptr<Command> cmd = std::move(redoStack.top());
+        redoStack.pop();
+
+        try {
+            cmd->execute();
+            undoStack.push(std::move(cmd));
+            AppLogger::getInstance()->log("Redo performed");
+        }
+        catch (const exception& e) {
+            string errorMsg = "Redo failed: " + string(e.what());
+            cerr << errorMsg << endl;
+            AppLogger::getInstance()->error(errorMsg);
+            redoStack.push(std::move(cmd));
+        }
+    }
+
+    bool canUndo() const { return !undoStack.empty(); }
+    bool canRedo() const { return !redoStack.empty(); }
 };
 
 // ==================== БАЗОВЫЙ КЛАСС STATE ====================
 class ToolState {
 protected:
-    EditorContext* context;
+    EditorContext* context = nullptr;
 public:
     virtual ~ToolState() = default;
-    void setContext(EditorContext* ctx) { context = ctx; }
+    virtual void setContext(EditorContext* ctx) { context = ctx; }
 
     virtual void onKeyPress(char key) {}
     virtual void onCursorMove(int dx, int dy) {}
@@ -337,7 +481,89 @@ public:
     virtual bool isDrawingMode() const { return false; }
 };
 
-// ==================== КОНКРЕТНЫЕ КОМАНДЫ (ДО ФАБРИКИ) ====================
+// ==================== КЛАСС EDITOR CONTEXT ====================
+class EditorContext {
+private:
+    unique_ptr<ToolState> currentState;
+    Canvas* canvas;
+    CommandHistory* history;
+
+public:
+    EditorContext(Canvas* c, CommandHistory* h) : canvas(c), history(h) {
+        if (!canvas || !history) {
+            AppLogger::getInstance()->error("EditorContext initialized with null pointers");
+            throw invalid_argument("Null pointers in EditorContext");
+        }
+        AppLogger::getInstance()->log("EditorContext created");
+    }
+
+    ~EditorContext() = default;
+
+    void setState(unique_ptr<ToolState> newState) {
+        if (newState) {
+            newState->setContext(this);
+            currentState = std::move(newState);
+        }
+        if (canvas) {
+            canvas->notifyToolChanged(getCurrentToolName(), getStatusMessage());
+        }
+    }
+
+    ToolState* getState() const { return currentState.get(); }
+
+    Canvas* getCanvas() const { return canvas; }
+    CommandHistory* getHistory() const { return history; }
+
+    void executeCommand(unique_ptr<Command> cmd) {
+        if (history && cmd) {
+            history->executeCommand(std::move(cmd));
+        }
+    }
+
+    void undo() {
+        if (history) history->undo();
+    }
+
+    void redo() {
+        if (history) history->redo();
+    }
+
+    void moveCursor(int dx, int dy) {
+        if (canvas) canvas->moveCursor(dx, dy);
+    }
+
+    void handleKeyPress(char key) {
+        if (currentState) {
+            currentState->onKeyPress(key);
+        }
+        if (canvas) {
+            canvas->notifyToolChanged(getCurrentToolName(), getStatusMessage());
+        }
+    }
+
+    void handleCursorMove(int dx, int dy) {
+        if (currentState) {
+            currentState->onCursorMove(dx, dy);
+        }
+        else if (canvas) {
+            canvas->moveCursor(dx, dy);
+        }
+    }
+
+    string getCurrentToolName() const {
+        return currentState ? currentState->getName() : "Курсор";
+    }
+
+    string getStatusMessage() const {
+        return currentState ? currentState->getStatusMessage() : "";
+    }
+
+    bool isDrawingMode() const {
+        return currentState ? currentState->isDrawingMode() : false;
+    }
+};
+
+// ==================== КОНКРЕТНЫЕ КОМАНДЫ ====================
 class DrawLineCommand : public Command {
 private:
     int x1, y1, x2, y2;
@@ -404,7 +630,7 @@ public:
 
 class ClearCommand : public Command {
 public:
-    ClearCommand(Canvas* c) : Command(c) {}
+    explicit ClearCommand(Canvas* c) : Command(c) {}
 
     void execute() override {
         saveBackup();
@@ -416,34 +642,59 @@ public:
     }
 };
 
-// ==================== ФАБРИЧНЫЙ МЕТОД ДЛЯ СОЗДАНИЯ КОМАНД ====================
-class CommandFactory {
+// ==================== КЛАСС ДЛЯ ОТОБРАЖЕНИЯ СПРАВКИ ====================
+class HelpDisplay {
 public:
-    enum CommandType {
-        DRAW_LINE,
-        DRAW_RECT,
-        FLOOD_FILL,
-        CLEAR
-    };
-
-    static Command* createCommand(CommandType type, Canvas* canvas,
-        int x1 = 0, int y1 = 0,
-        int x2 = 0, int y2 = 0,
-        char ch = '@', bool fill = false) {
-        switch (type) {
-        case DRAW_LINE:
-            return new DrawLineCommand(canvas, x1, y1, x2, y2, ch);
-        case DRAW_RECT:
-            return new DrawRectCommand(canvas, x1, y1, x2, y2, fill, ch);
-        case FLOOD_FILL:
-            return new FloodFillCommand(canvas, x1, y1, ch);
-        case CLEAR:
-            return new ClearCommand(canvas);
-        default:
-            return nullptr;
-        }
+    static void show(Canvas* canvas = nullptr) {
+        system("cls");
+        cout << "==================== ПОМОЩЬ ====================" << endl;
+        cout << "Управление курсором:" << endl;
+        cout << "  Стрелки - перемещение курсора" << endl;
+        cout << endl;
+        cout << "Инструменты:" << endl;
+        cout << "  L - режим рисования линии" << endl;
+        cout << "  R - режим рисования прямоугольника" << endl;
+        cout << "  F - заливка области" << endl;
+        cout << "  C - очистить весь холст" << endl;
+        cout << "  U - отменить последнее действие" << endl;
+        cout << "  Ctrl+Z - отменить (альтернатива)" << endl;
+        cout << "  Ctrl+Y - повторить" << endl;
+        cout << endl;
+        cout << "Работа с файлами:" << endl;
+        cout << "  S - сохранить в файл (.ascii или .txt)" << endl;
+        cout << "  O - загрузить из файла (.ascii или .txt)" << endl;
+        cout << endl;
+        cout << "Символы:" << endl;
+        cout << "  Любой печатный символ - установить текущий символ" << endl;
+        cout << "  1-9 - быстрый выбор: @ # % * + - = | /" << endl;
+        cout << endl;
+        cout << "Прочее:" << endl;
+        cout << "  H - показать эту справку" << endl;
+        cout << "  Q - выход" << endl;
+        cout << endl;
+        cout << "================================================" << endl;
+        cout << "Нажмите любую клавишу для продолжения...";
+        _getch();
+        if (canvas) canvas->notifyCanvasChanged();
     }
 };
+
+// ==================== РЕАЛИЗАЦИЯ МЕТОДОВ COMMAND ====================
+void Command::saveBackup() {
+    backup = make_unique<Memento>(
+        canvas->getGridSnapshot(),
+        canvas->getCursorX(),
+        canvas->getCursorY(),
+        canvas->getCurrentChar()
+    );
+}
+
+void Command::undo() {
+    if (backup) {
+        canvas->restoreFromMemento(*backup);
+        canvas->notifyStateChanged("Действие отменено");
+    }
+}
 
 // ==================== КОНКРЕТНЫЙ НАБЛЮДАТЕЛЬ - ОТОБРАЖЕНИЕ ====================
 class ConsoleRenderer : public CanvasObserver {
@@ -460,9 +711,9 @@ public:
         HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
         system("cls");
 
-        cout << "=";
-        for (int x = 0; x < width + 2; x++) cout << "=";
-        cout << "=" << endl;
+        cout << "+";
+        for (int x = 0; x < width + 2; x++) cout << "-";
+        cout << "+" << endl;
 
         for (int y = 0; y < height; y++) {
             cout << "| ";
@@ -479,9 +730,9 @@ public:
             cout << " |" << endl;
         }
 
-        cout << "=";
-        for (int x = 0; x < width + 2; x++) cout << "=";
-        cout << "=" << endl;
+        cout << "+";
+        for (int x = 0; x < width + 2; x++) cout << "-";
+        cout << "+" << endl;
 
         cout << " ===============================================================================" << endl;
         cout << "| Текущий символ: [" << canvas.getCurrentChar() << "]     Активный инструмент: " << currentToolName;
@@ -522,7 +773,7 @@ public:
 class CursorState : public ToolState {
 public:
     void onCursorMove(int dx, int dy) override {
-        context->getCanvas()->moveCursor(dx, dy);
+        if (context) context->getCanvas()->moveCursor(dx, dy);
     }
 
     string getName() const override { return "Курсор"; }
@@ -557,313 +808,116 @@ public:
     bool isDrawingMode() const override { return true; }
 };
 
-// ==================== РЕАЛИЗАЦИЯ МЕТОДОВ ====================
-
-void Command::saveBackup() {
-    delete backup;
-    backup = new Memento(
-        canvas->getGridSnapshot(),
-        canvas->getCursorX(),
-        canvas->getCursorY(),
-        canvas->getCurrentChar()
-    );
-}
-
-void Command::undo() {
-    if (backup) {
-        canvas->restoreFromMemento(*backup);
-        canvas->notifyStateChanged("Действие отменено");
-    }
-}
-
-CommandHistory::~CommandHistory() {
-    while (!undoStack.empty()) {
-        delete undoStack.top();
-        undoStack.pop();
-    }
-    while (!redoStack.empty()) {
-        delete redoStack.top();
-        redoStack.pop();
-    }
-}
-
-void CommandHistory::executeCommand(Command* cmd) {
-    cmd->execute();
-    undoStack.push(cmd);
-    while (!redoStack.empty()) {
-        delete redoStack.top();
-        redoStack.pop();
-    }
-}
-
-void CommandHistory::undo() {
-    if (undoStack.empty()) return;
-    Command* cmd = undoStack.top();
-    undoStack.pop();
-    cmd->undo();
-    redoStack.push(cmd);
-}
-
-void CommandHistory::redo() {
-    if (redoStack.empty()) return;
-    Command* cmd = redoStack.top();
-    redoStack.pop();
-    cmd->execute();
-    undoStack.push(cmd);
-}
-
-EditorContext::EditorContext(Canvas* c, CommandHistory* h)
-    : currentState(nullptr), canvas(c), history(h) {
-}
-
-EditorContext::~EditorContext() {
-    delete currentState;
-}
-
-void EditorContext::setState(ToolState* newState) {
-    delete currentState;
-    currentState = newState;
-    if (currentState) {
-        currentState->setContext(this);
-    }
-    canvas->notifyToolChanged(getCurrentToolName(), getStatusMessage());
-}
-
-void EditorContext::executeCommand(Command* cmd) {
-    history->executeCommand(cmd);
-}
-
-void EditorContext::undo() {
-    history->undo();
-}
-
-void EditorContext::redo() {
-    history->redo();
-}
-
-void EditorContext::moveCursor(int dx, int dy) {
-    canvas->moveCursor(dx, dy);
-}
-
-void EditorContext::handleKeyPress(char key) {
-    if (currentState) {
-        currentState->onKeyPress(key);
-    }
-    canvas->notifyToolChanged(getCurrentToolName(), getStatusMessage());
-}
-
-void EditorContext::handleCursorMove(int dx, int dy) {
-    if (currentState) {
-        currentState->onCursorMove(dx, dy);
-    }
-    else {
-        canvas->moveCursor(dx, dy);
-    }
-}
-
-string EditorContext::getCurrentToolName() const {
-    return currentState ? currentState->getName() : "Курсор";
-}
-
-string EditorContext::getStatusMessage() const {
-    return currentState ? currentState->getStatusMessage() : "";
-}
-
-bool EditorContext::isDrawingMode() const {
-    return currentState ? currentState->isDrawingMode() : false;
-}
-
-// Реализация методов LineToolState
+// ==================== РЕАЛИЗАЦИЯ МЕТОДОВ СОСТОЯНИЙ ====================
 void LineToolState::onKeyPress(char key) {
+    if (!context) return;
     Canvas* canvas = context->getCanvas();
+
     if (key == 13) {
         if (!waitingForSecondPoint) {
             startX = canvas->getCursorX();
             startY = canvas->getCursorY();
             waitingForSecondPoint = true;
             canvas->notifyStateChanged("Первая точка выбрана. Переместите курсор ко второй точке и нажмите Enter");
-            canvas->notifyToolChanged(context->getCurrentToolName(), getStatusMessage());
         }
         else {
-            Command* cmd = CommandFactory::createCommand(
-                CommandFactory::DRAW_LINE,
-                canvas,
-                startX, startY,
+            // Создаём команду напрямую, без фабрики
+            context->executeCommand(make_unique<DrawLineCommand>(
+                canvas, startX, startY,
                 canvas->getCursorX(), canvas->getCursorY(),
                 canvas->getCurrentChar()
-            );
-            context->executeCommand(cmd);
-            context->setState(new CursorState());
+            ));
+            context->setState(make_unique<CursorState>());
             canvas->notifyStateChanged("Линия нарисована. Возврат в режим курсора");
         }
     }
     else if (key == 27) {
         waitingForSecondPoint = false;
-        context->setState(new CursorState());
+        context->setState(make_unique<CursorState>());
         canvas->notifyStateChanged("Режим рисования линии отменен");
     }
 }
 
 void LineToolState::onCursorMove(int dx, int dy) {
-    context->getCanvas()->moveCursor(dx, dy);
+    if (context) context->getCanvas()->moveCursor(dx, dy);
 }
 
-// Реализация методов RectToolState
 void RectToolState::onKeyPress(char key) {
+    if (!context) return;
     Canvas* canvas = context->getCanvas();
+
     if (key == 13) {
         if (!waitingForSecondPoint) {
             startX = canvas->getCursorX();
             startY = canvas->getCursorY();
             waitingForSecondPoint = true;
             canvas->notifyStateChanged("Первый угол выбран. Переместите курсор ко второму углу и нажмите Enter");
-            canvas->notifyToolChanged(context->getCurrentToolName(), getStatusMessage());
         }
         else {
-            Command* cmd = CommandFactory::createCommand(
-                CommandFactory::DRAW_RECT,
-                canvas,
-                startX, startY,
+            // Создаём команду напрямую, без фабрики
+            context->executeCommand(make_unique<DrawRectCommand>(
+                canvas, startX, startY,
                 canvas->getCursorX(), canvas->getCursorY(),
-                canvas->getCurrentChar(),
-                false
-            );
-            context->executeCommand(cmd);
-            context->setState(new CursorState());
+                false, canvas->getCurrentChar()
+            ));
+            context->setState(make_unique<CursorState>());
             canvas->notifyStateChanged("Прямоугольник нарисован. Возврат в режим курсора");
         }
     }
     else if (key == 27) {
         waitingForSecondPoint = false;
-        context->setState(new CursorState());
+        context->setState(make_unique<CursorState>());
         canvas->notifyStateChanged("Режим рисования прямоугольника отменен");
     }
 }
 
 void RectToolState::onCursorMove(int dx, int dy) {
-    context->getCanvas()->moveCursor(dx, dy);
+    if (context) context->getCanvas()->moveCursor(dx, dy);
 }
 
-// ==================== КЛАСС INPUT HANDLER ====================
 // ==================== КЛАСС INPUT HANDLER ====================
 class InputHandler {
 private:
     EditorContext* context;
 
-    void showHelp() {
-        system("cls");
-        cout << "==================== ПОМОЩЬ ====================" << endl;
-        cout << "Управление курсором:" << endl;
-        cout << "  Стрелки - перемещение курсора" << endl;
-        cout << endl;
-        cout << "Инструменты:" << endl;
-        cout << "  L - режим рисования линии" << endl;
-        cout << "  R - режим рисования прямоугольника" << endl;
-        cout << "  F - заливка области" << endl;
-        cout << "  C - очистить весь холст" << endl;
-        cout << "  U - отменить последнее действие" << endl;
-        cout << "  Ctrl+Z - отменить (альтернатива)" << endl;
-        cout << "  Ctrl+Y - повторить" << endl;
-        cout << endl;
-        cout << "Работа с файлами:" << endl;
-        cout << "  S - сохранить в файл (.ascii или .txt)" << endl;
-        cout << "  O - загрузить из файла (.ascii или .txt)" << endl;
-        cout << endl;
-        cout << "Символы:" << endl;
-        cout << "  Любой печатный символ - установить текущий символ" << endl;
-        cout << "  1-9 - быстрый выбор: @ # % * + - = | /" << endl;
-        cout << endl;
-        cout << "Прочее:" << endl;
-        cout << "  H - показать эту справку" << endl;
-        cout << "  Q - выход" << endl;
-        cout << endl;
-        cout << "================================================" << endl;
-        cout << "Нажмите любую клавишу для продолжения...";
-        _getch();
-        context->getCanvas()->notifyCanvasChanged();
+public:
+    explicit InputHandler(EditorContext* ctx) : context(ctx) {
+        AppLogger::getInstance()->log("InputHandler created");
     }
 
-public:
-    InputHandler(EditorContext* ctx) : context(ctx) {}
-
     void handleKeyPress(char key) {
+        if (!context) return;
         Canvas* canvas = context->getCanvas();
+        if (!canvas) return;
 
-        switch (key) {
-        case '1':
-            canvas->setCurrentChar('@');
-            canvas->notifyCanvasChanged();  // Добавлено
-            return;
-        case '2':
-            canvas->setCurrentChar('#');
-            canvas->notifyCanvasChanged();  // Добавлено
-            return;
-        case '3':
-            canvas->setCurrentChar('%');
-            canvas->notifyCanvasChanged();  // Добавлено
-            return;
-        case '4':
-            canvas->setCurrentChar('*');
-            canvas->notifyCanvasChanged();  // Добавлено
-            return;
-        case '5':
-            canvas->setCurrentChar('+');
-            canvas->notifyCanvasChanged();  // Добавлено
-            return;
-        case '6':
-            canvas->setCurrentChar('-');
-            canvas->notifyCanvasChanged();  // Добавлено
-            return;
-        case '7':
-            canvas->setCurrentChar('=');
-            canvas->notifyCanvasChanged();  // Добавлено
-            return;
-        case '8':
-            canvas->setCurrentChar('|');
-            canvas->notifyCanvasChanged();  // Добавлено
-            return;
-        case '9':
-            canvas->setCurrentChar('/');
-            canvas->notifyCanvasChanged();  // Добавлено
+        
+
+        if ((key == 'L' || key == 'l') && !context->isDrawingMode()) {
+            context->setState(make_unique<LineToolState>());
+            canvas->notifyCanvasChanged();
             return;
         }
 
-        if (key == 'L' || key == 'l') {
-            if (!context->isDrawingMode()) {
-                context->setState(new LineToolState());
-                canvas->notifyCanvasChanged();
-            }
-            return;
-        }
-
-        if (key == 'R' || key == 'r') {
-            if (!context->isDrawingMode()) {
-                context->setState(new RectToolState());
-                canvas->notifyCanvasChanged();
-            }
+        if ((key == 'R' || key == 'r') && !context->isDrawingMode()) {
+            context->setState(make_unique<RectToolState>());
+            canvas->notifyCanvasChanged();
             return;
         }
 
         if (!context->isDrawingMode()) {
             switch (key) {
             case 'F': case 'f': {
-                Command* cmd = CommandFactory::createCommand(
-                    CommandFactory::FLOOD_FILL,
-                    canvas,
-                    canvas->getCursorX(), canvas->getCursorY(),
-                    0, 0,
+                // Создаём команду напрямую, без фабрики
+                context->executeCommand(make_unique<FloodFillCommand>(
+                    canvas, canvas->getCursorX(), canvas->getCursorY(),
                     canvas->getCurrentChar()
-                );
-                context->executeCommand(cmd);
+                ));
                 canvas->notifyCanvasChanged();
                 return;
             }
             case 'C': case 'c': {
-                Command* cmd = CommandFactory::createCommand(
-                    CommandFactory::CLEAR,
-                    canvas
-                );
-                context->executeCommand(cmd);
+                // Создаём команду напрямую, без фабрики
+                context->executeCommand(make_unique<ClearCommand>(canvas));
                 canvas->notifyCanvasChanged();
                 return;
             }
@@ -891,15 +945,16 @@ public:
                 return;
             }
             case 'H': case 'h':
-                showHelp();
+                HelpDisplay::show(canvas);
                 return;
             case 'Q': case 'q':
+                AppLogger::getInstance()->log("Application closed by user");
                 exit(0);
                 return;
             default:
                 if (key >= 32 && key <= 126) {
                     canvas->setCurrentChar(key);
-                    canvas->notifyCanvasChanged();  // Добавлено
+                    canvas->notifyCanvasChanged();
                 }
                 return;
             }
@@ -910,70 +965,85 @@ public:
     }
 
     void handleCursorMove(int dx, int dy) {
-        context->handleCursorMove(dx, dy);
+        if (context) context->handleCursorMove(dx, dy);
     }
 };
 
 // ==================== ГЛАВНАЯ ФУНКЦИЯ ====================
 int main() {
-    SetConsoleOutputCP(CP_UTF8);
-    setlocale(LC_ALL, "Russian");
+    try {
+        SetConsoleOutputCP(CP_UTF8);
+        setlocale(LC_ALL, "Russian");
 
-    int width, height;
+        // Singleton логгер уже готов к использованию
+        AppLogger::getInstance()->log("Application started");
+        AppLogger::getInstance()->setConsoleOutput(false); // Логи в консоль отключаем, только в файл
 
-    cout << "==========================================================" << endl;
-    cout << "|                   ASCII DRAW STUDIO                    |" << endl;
-    cout << "|                 Редактор псевдографики                 |" << endl;
-    cout << "==========================================================" << endl;
-    cout << endl;
-    cout << "Введите размеры холста (от 40x20 до 200x100)" << endl;
-    cout << "Ширина (40-200): ";
-    cin >> width;
-    cout << "Высота (20-100): ";
-    cin >> height;
+        int width, height;
 
-    Canvas canvas(width, height);
-    CommandHistory history;
-    EditorContext context(&canvas, &history);
+        cout << "==========================================================" << endl;
+        cout << "|                   ASCII DRAW STUDIO                    |" << endl;
+        cout << "|                 Редактор псевдографики                 |" << endl;
+        cout << "==========================================================" << endl;
+        cout << endl;
+        cout << "Введите размеры холста (от 40x20 до 200x100)" << endl;
+        cout << "Ширина (40-200): ";
+        cin >> width;
+        cout << "Высота (20-100): ";
+        cin >> height;
 
-    ConsoleRenderer renderer(width, height);
-    canvas.attachObserver(&renderer);
+        AppLogger::getInstance()->log("User selected canvas size: " + to_string(width) + "x" + to_string(height));
 
-    context.setState(new CursorState());
-    InputHandler handler(&context);
+        Canvas canvas(width, height);
+        CommandHistory history;
+        EditorContext context(&canvas, &history);
 
-    canvas.notifyCanvasChanged();
+        ConsoleRenderer renderer(width, height);
+        canvas.attachObserver(&renderer);
 
-    while (true) {
-        if (!_kbhit()) {
-            Sleep(10);
-            continue;
-        }
+        context.setState(make_unique<CursorState>());
+        InputHandler handler(&context);
 
-        char key = _getch();
+        canvas.notifyCanvasChanged();
 
-        if (key == -32 || key == 224) {
-            key = _getch();
-            switch (key) {
-            case 72: handler.handleCursorMove(0, -1); break;
-            case 80: handler.handleCursorMove(0, 1); break;
-            case 75: handler.handleCursorMove(-1, 0); break;
-            case 77: handler.handleCursorMove(1, 0); break;
+        while (true) {
+            if (!_kbhit()) {
+                Sleep(10);
+                continue;
             }
-        }
-        else {
-            if (key == 26) {
-                context.undo();
-                canvas.notifyCanvasChanged();
-            }
-            else if (key == 25) {
-                context.redo();
-                canvas.notifyCanvasChanged();
+
+            char key = _getch();
+
+            if (key == -32 || key == 224) {
+                key = _getch();
+                switch (key) {
+                case 72: handler.handleCursorMove(0, -1); break;
+                case 80: handler.handleCursorMove(0, 1); break;
+                case 75: handler.handleCursorMove(-1, 0); break;
+                case 77: handler.handleCursorMove(1, 0); break;
+                }
             }
             else {
-                handler.handleKeyPress(key);
+                if (key == 26) {
+                    context.undo();
+                    canvas.notifyCanvasChanged();
+                }
+                else if (key == 25) {
+                    context.redo();
+                    canvas.notifyCanvasChanged();
+                }
+                else {
+                    handler.handleKeyPress(key);
+                }
             }
         }
+    }
+    catch (const exception& e) {
+        string errorMsg = "Fatal error: " + string(e.what());
+        cerr << errorMsg << endl;
+        AppLogger::getInstance()->error(errorMsg);
+        system("pause");
+        return 1;
     }
 
     return 0;
